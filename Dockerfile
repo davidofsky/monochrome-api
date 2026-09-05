@@ -13,7 +13,9 @@ RUN apt-get update \
 COPY . .
 
 # cloakbrowser downloads its Chromium into the home cache on first launch; keep it writable.
-RUN mkdir -p /home/node/.cloakbrowser && chown -R node:node /home/node /app
+# (Only chown the cache dir — a recursive chown of /app/node_modules is huge and needless;
+# the node user just needs to read the app, which root-owned files already allow.)
+RUN mkdir -p /home/node/.cloakbrowser && chown node:node /home/node/.cloakbrowser
 USER node
 
 ENV NODE_ENV=production
