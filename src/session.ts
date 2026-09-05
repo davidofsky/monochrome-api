@@ -105,6 +105,24 @@ export class Session {
     return refreshed;
   }
 
+  async #ensureFreshTurnstileJwt(): Promise<void> {
+    const jwt = await this.#activePage.evaluate(() => localStorage.getItem('unified-playback-turnstile-jwt'));
+    let valid = false;
+    if (jwt) {
+      try {
+        const payload = JSON.parse(Buffer.from(jwt.split('.')[1] ?? '', 'base64').toString());
+        valid = typeof payload.exp === 'number' && payload.exp * 1000 - Date.now() > 60_000;
+      } catch {
+        valid = false;
+      }
+    }
+    if (!valid) {
+      log.debug('turnstile jwt missing/expiring, reloading app');
+      await this.#activePage.goto(MONOCHROME_URL);
+      await this.#waitForTokens();
+    }
+  }
+
   async tidalGet<T = unknown>(path: string, params: Record<string, string> = {}): Promise<TidalResult<T>> {
     const token = await this.tidalToken();
     const usp = new URLSearchParams({ countryCode: config.TIDAL_COUNTRY, ...params });
@@ -124,6 +142,8 @@ export class Session {
 
   async getTrack(params: GetTrackParams): Promise<PlaybackResource> {
     const { track, artist, album, isrc, duration, quality = 'LOSSLESS', retries = 3, retryDelayMs = 2000 } = params;
+
+    await this.#ensureFreshTurnstileJwt();
 
     // A quality ladder is used just like monochrome.tf does. If a certain quality doesnt work -> try a lower tier
     const qLadder = quality === 'HI_RES_LOSSLESS' ? ['HI_RES_LOSSLESS', 'LOSSLESS'] : ['LOSSLESS', 'HI_RES_LOSSLESS'];
