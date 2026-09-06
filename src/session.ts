@@ -189,6 +189,7 @@ export class Session {
     };
 
     let lastReasons = '';
+    let reminted = false;
     for (let attempt = 1; attempt <= retries; attempt++) {
       for (const q of qLadder) {
         const { status, body } = await this.#activePage.evaluate(
@@ -201,6 +202,15 @@ export class Session {
           },
           { url: buildUrl(q), apiKey: config.GEEKED_API_KEY },
         );
+
+        // geeked rejects a stale/revoked turnstile jwt with 401 (not a source failure). The jwt can be
+        // revoked before its time-expiry, so re-mint once and retry with a fresh token.
+        if (status === 401 && !reminted) {
+          log.debug('geeked 401 (invalid turnstile jwt), re-minting and retrying');
+          reminted = true;
+          await this.#refreshTokens();
+          continue;
+        }
 
         const data = GeekedTrackResponse.parse(JSON.parse(body));
         const resource = data.playback[0];
