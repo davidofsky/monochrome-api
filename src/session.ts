@@ -63,6 +63,7 @@ export interface TidalResult<T = unknown> {
 export class Session {
   #browser: Browser | null = null;
   #page: Page | null = null;
+  #refreshing: Promise<void> | null = null;
 
   get #activePage(): Page {
     if (!this.#page) throw new Error('Session not started');
@@ -90,6 +91,27 @@ export class Session {
     );
   }
 
+  async #refreshTokens(): Promise<void> {
+    if (this.#refreshing) return this.#refreshing;
+    this.#refreshing = (async () => {
+      try {
+        log.debug('refreshing tokens (clear + reload)');
+
+        // Remove the tokens first, otherwise no new tokens are received
+        await this.#activePage.evaluate(() => {
+          localStorage.removeItem('hifi_token');
+          localStorage.removeItem('hifi_token_expiry');
+          localStorage.removeItem('unified-playback-turnstile-jwt');
+        });
+        await this.#activePage.goto(MONOCHROME_URL);
+        await this.#waitForTokens();
+      } finally {
+        this.#refreshing = null;
+      }
+    })();
+    return this.#refreshing;
+  }
+
   async tidalToken(): Promise<string> {
     const { tok, exp } = await this.#activePage.evaluate(() => ({
       tok: localStorage.getItem('hifi_token'),
@@ -97,9 +119,8 @@ export class Session {
     }));
     if (tok && (exp === 0 || exp - Date.now() > 60_000)) return tok;
 
-    log.debug('tidal token missing/expiring, reloading app');
-    await this.#activePage.goto(MONOCHROME_URL);
-    await this.#waitForTokens();
+    log.debug('tidal token missing/expiring, re-minting');
+    await this.#refreshTokens();
     const refreshed = await this.#activePage.evaluate(() => localStorage.getItem('hifi_token'));
     if (!refreshed) throw new Error('Failed to obtain Tidal token');
     return refreshed;
@@ -117,27 +138,37 @@ export class Session {
       }
     }
     if (!valid) {
-      log.debug('turnstile jwt missing/expiring, reloading app');
-      await this.#activePage.goto(MONOCHROME_URL);
-      await this.#waitForTokens();
+      log.debug('turnstile jwt missing/expiring, re-minting');
+      await this.#refreshTokens();
     }
   }
 
   async tidalGet<T = unknown>(path: string, params: Record<string, string> = {}): Promise<TidalResult<T>> {
-    const token = await this.tidalToken();
     const usp = new URLSearchParams({ countryCode: config.TIDAL_COUNTRY, ...params });
-    const res = await fetch(`${TIDAL_API}${path}?${usp.toString()}`, {
-      headers: { authorization: `Bearer ${token}`, accept: 'application/json' },
-    });
-    const text = await res.text();
-    let json: unknown;
-    try {
-      json = JSON.parse(text);
-    } catch {
-      json = { raw: text };
+    const url = `${TIDAL_API}${path}?${usp.toString()}`;
+
+    const call = async (): Promise<TidalResult<T>> => {
+      const token = await this.tidalToken();
+      const res = await fetch(url, { headers: { authorization: `Bearer ${token}`, accept: 'application/json' } });
+      const text = await res.text();
+      let json: unknown;
+      try {
+        json = JSON.parse(text);
+      } catch {
+        json = { raw: text };
+      }
+      return { status: res.status, json: json as T };
+    };
+
+    let result = await call();
+    // A stored-valid token can still be rejected (Tidal revoked/rotated it early). Force a re-mint and retry once.
+    if (result.status === 401) {
+      log.debug({ path }, 'tidal 401, re-minting token and retrying');
+      await this.#refreshTokens();
+      result = await call();
     }
-    log.debug({ path, status: res.status }, 'tidal request');
-    return { status: res.status, json: json as T };
+    log.debug({ path, status: result.status }, 'tidal request');
+    return result;
   }
 
   async getTrack(params: GetTrackParams): Promise<PlaybackResource> {
